@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <stdint.h>
 #include <math.h>
 #include <string.h>
 #include <errno.h>
@@ -11,7 +12,12 @@
 #include <alsa/global.h>
 
 
-#define IPC_PERM 0666
+#define	GET_S16LE_SAMPLE(ptr)		((int16_t)(*(int16_t*)(ptr)));
+#define	MULT_S16_S15_RND(a, b)		((int16_t)((((int32_t)(a) * (b)) + 0x2000) >> 14))
+#define	PUT_S16LE_SAMPLE(ptr, sample) 	((*(int16_t*)(ptr)) = (sample))
+
+#define	SAMPLE_SIZE_BYTES	2
+#define IPC_PERM 		0666
 
 
 typedef struct fading_shared_data
@@ -108,8 +114,9 @@ static int fade_init(snd_pcm_extplug_t *ext)
   return 0;
 }
 
-static inline void apply_fading(snd_pcm_fading_t *fading_data, int *src, int *dst, int n, int m)
+static inline void apply_fading(snd_pcm_fading_t *fading_data, int16_t *src, int16_t *dst, int n, int m)
 {
+  
   int i, j;
   
   for(i = 0; i < n; i++)
@@ -117,6 +124,31 @@ static inline void apply_fading(snd_pcm_fading_t *fading_data, int *src, int *ds
     for(j = 0; j < m; j++)
       dst[i + n * j] = (src[i + n * j] * fading_data->iteration_sum);
   }
+  
+  /*
+  uint16_t frame;
+  uint8_t chan;
+  uint16_t indx = 0;
+  
+  for(frame = 0; frame < num_frames; frame++)
+  {
+    // Update current volume value
+    int16_t curVolume = fading_data->iteration_sum;
+
+    // Process all the audio channels (mono = S|S|S ... stereo = L|R|L|R...)
+    for(chan = 0; chan < num_channels; chan++)
+    {
+	// Retrieve S16 LE sample from input buffer
+	int16_t sample = GET_S16LE_SAMPLE(src + indx);
+
+	// Apply current volume and write sample to output buffer as S16 LE
+	PUT_S16LE_SAMPLE(dst + indx, MULT_S16_S15_RND(sample, curVolume));
+
+	// Move to next sample
+	indx += SAMPLE_SIZE_BYTES;
+      }
+  }*/
+  
 }
 
 static snd_pcm_sframes_t fade_transfer(snd_pcm_extplug_t *ext,
@@ -126,13 +158,13 @@ static snd_pcm_sframes_t fade_transfer(snd_pcm_extplug_t *ext,
 	       snd_pcm_uframes_t src_offset,
 	       snd_pcm_uframes_t size)
 {
-  int *src, *dst;
+  int16_t *src, *dst;
   snd_pcm_fading_t *fading_data;
   
   fading_data = ext->private_data;
   
-  src = (int*)(src_areas->addr + ((src_areas->first + (src_areas->step * src_offset)))/8);
-  dst = (int*)(dst_areas->addr + ((dst_areas->first + (dst_areas->step * dst_offset)))/8);
+  src = (src_areas->addr + ((src_areas->first + (src_areas->step * src_offset)))/8);
+  dst = (dst_areas->addr + ((dst_areas->first + (dst_areas->step * dst_offset)))/8);
   
   if(fading_data->fading_command_data->enable)
   {
@@ -145,7 +177,7 @@ static snd_pcm_sframes_t fade_transfer(snd_pcm_extplug_t *ext,
     apply_fading(fading_data, src, dst, size, ext->channels);
   }
   else
-    snd_pcm_areas_copy(dst_areas, dst_offset, src_areas, src_offset, ext->channels, size, SND_PCM_FORMAT_S32);
+    snd_pcm_areas_copy(dst_areas, dst_offset, src_areas, src_offset, ext->channels, size, SND_PCM_FORMAT_S16);
     //pcm_raw_copy(src, dst, size, ext->channels);
   
   return size;
@@ -257,8 +289,8 @@ SND_PCM_PLUGIN_DEFINE_FUNC(fading)
   
   snd_pcm_extplug_set_param_minmax(&fading_data->ext, SND_PCM_EXTPLUG_HW_CHANNELS, 2, 2);
   snd_pcm_extplug_set_slave_param(&fading_data->ext, SND_PCM_EXTPLUG_HW_CHANNELS, 2);
-  snd_pcm_extplug_set_param(&fading_data->ext, SND_PCM_EXTPLUG_HW_FORMAT, SND_PCM_FORMAT_S32);
-  snd_pcm_extplug_set_slave_param(&fading_data->ext, SND_PCM_EXTPLUG_HW_FORMAT, SND_PCM_FORMAT_S32);
+  snd_pcm_extplug_set_param(&fading_data->ext, SND_PCM_EXTPLUG_HW_FORMAT, SND_PCM_FORMAT_S16);
+  snd_pcm_extplug_set_slave_param(&fading_data->ext, SND_PCM_EXTPLUG_HW_FORMAT, SND_PCM_FORMAT_S16);
   
   
   *pcmp = fading_data->ext.pcm;
