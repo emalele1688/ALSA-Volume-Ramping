@@ -15,6 +15,8 @@
 #include <alsa/pcm_external.h>
 #include <alsa/global.h>
 
+#include "ramping.h"
+
 
 #define ERROR(message){			\
 		destroy();		\
@@ -26,15 +28,14 @@
 #define PLUGIN_DESCRIPTION	"ALSA Controller volume plugin with fading support"
 
 #define IPC_PERM 		0666
-#define MICRO 			1000000L
 
 
 
 /*************************************** Shared data struct */
 typedef struct volume_control_command
 {
-  double new_volume;		// New volume to fadeout/fadein
-  time_t time_gradient;		// Time take to fadeout/fadein
+  float new_volume;		// New volume to fadeout/fadein
+  float time_gradient;		// Ramp length
   
 } volume_control_command_t;
 
@@ -45,9 +46,9 @@ typedef struct snd_pcm_volume_control
   volume_control_command_t *volume_command_data;
   snd_pcm_extplug_t ext;
   
-  double current_volume;	// Current volume of the pcm
-  double target_volume;		// Next level volume to switch
-  double start_volume;		// Take the current volume when the fading is enable
+  float current_volume;		// Current volume of the pcm
+  float target_volume;		// Next level volume to switch
+  float start_volume;		// Take the current volume when the fading is enable
 
   key_t ipc_key;
   int shmid;
@@ -61,8 +62,6 @@ static int ipc_connect(void);
 static int control_vol_init(snd_pcm_extplug_t *ext);
 
 static void destroy();
-
-static double ramping(double target_volume, time_t time_gradient, double start_volume);
 
 static snd_pcm_sframes_t control_vol_transfer(snd_pcm_extplug_t *ext,
 	       const snd_pcm_channel_area_t *dst_areas,
@@ -93,10 +92,7 @@ static const snd_pcm_extplug_callback_t controll_vol_callback =
 
 static snd_pcm_volume_control_t *volume_control_data = NULL;
 
-static struct timeval time_start;
-
 const char* message = NULL;
-
 
 
 static int ipc_connect(void)
@@ -148,33 +144,7 @@ static void destroy(void)
   }
 }
 
-static double ramping(double target_volume, time_t time_gradient, double start_volume)
-{
-  struct timeval current_time;
-  double cvolume, ratio;
-  uint32_t time_lapse;
-  
-  gettimeofday(&current_time, NULL);
-  time_lapse = (MICRO * (current_time.tv_sec - time_start.tv_sec)) + (current_time.tv_usec - time_start.tv_usec); 
-  
-  ratio = (double)time_lapse / (double)time_gradient;
-  ratio *= 0.000001;
-  
-  if(ratio > 1.0f)
-    ratio = 1.0f;
-  
-  cvolume = ((target_volume - start_volume) * ratio) + start_volume;
-  
-#ifdef DEBUG
-  printf("time lapse: %u\n", time_lapse);
-  printf("ratio: %f\n", ratio);
-  printf("volume computed: %f\n", cvolume);
-#endif
-    
-  return cvolume;
-}
-
-static inline void apply_volume_to_output(int16_t *src, int16_t *dst, double volume, int sample_num, int channels_num)
+static inline void apply_volume_to_output(int16_t *src, int16_t *dst, float volume, int sample_num, int channels_num)
 {
   int i, j;
   
@@ -202,18 +172,21 @@ static snd_pcm_sframes_t control_vol_transfer(snd_pcm_extplug_t *ext,
     if(volume_control_data->target_volume != volume_control_data->volume_command_data->new_volume)
     {
       // init ramp counter:
-      gettimeofday(&time_start, NULL);
+      ramping_settime();
       
       volume_control_data->target_volume = volume_control_data->volume_command_data->new_volume;
       volume_control_data->start_volume = volume_control_data->current_volume;
     }
     
-    volume_control_data->current_volume = ramping(volume_control_data->target_volume, 
+    volume_control_data->current_volume = ramping_execute(volume_control_data->target_volume, 
 						   volume_control_data->volume_command_data->time_gradient,
 						   volume_control_data->start_volume
 						  );
+#ifdef DEBUG
+    printf("current_volume: %f\n", volume_control_data->current_volume);
+#endif
   }
-  else /* if(volume_controll_data->target_volume != volume_controll_data->current_volume) */
+  else
   {
     volume_control_data->target_volume = volume_control_data->current_volume;
     volume_control_data->start_volume = volume_control_data->current_volume;
@@ -258,6 +231,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(PLUGIN_NAME)
   const char *id;
   snd_config_t *n, *slave = NULL;
   snd_config_iterator_t i, next;
+  unsigned int channels = 0;
   int err;
   
   if( (volume_control_data = malloc(sizeof(snd_pcm_volume_control_t))) == NULL)
@@ -291,17 +265,38 @@ SND_PCM_PLUGIN_DEFINE_FUNC(PLUGIN_NAME)
       continue;
     }
     
+    if(strcmp(id, "channel") == 0)
+    {
+      snd_config_get_integer(n, (long int*)&channels);
+#ifdef DEBUG
+      printf("channel: %d\n", channels);
+#endif
+      continue;
+    }
+
     SNDERR("Unknown field %s", id);
     destroy();
     return -EINVAL;
   }
   
   if(!slave)
+  {
+	message = "No slave parameter";
     ERROR(message);
+  }
   
   if(volume_control_data->ipc_key == -1)
+  {
+	message = "Enter ipc_key parameter";
     ERROR(message);
+  }
   
+  if(!channels)
+  {
+	message = "Enter channels number";
+	ERROR(message);
+  }
+
   volume_control_data->ext.version = SND_PCM_EXTPLUG_VERSION;
   volume_control_data->ext.name = PLUGIN_DESCRIPTION;
   volume_control_data->ext.callback = &controll_vol_callback;
@@ -311,11 +306,10 @@ SND_PCM_PLUGIN_DEFINE_FUNC(PLUGIN_NAME)
   if (err < 0) 
     ERROR(message);
   
-  snd_pcm_extplug_set_param_minmax(&volume_control_data->ext, SND_PCM_EXTPLUG_HW_CHANNELS, 2, 2);
-  snd_pcm_extplug_set_slave_param(&volume_control_data->ext, SND_PCM_EXTPLUG_HW_CHANNELS, 2);
+  snd_pcm_extplug_set_param_minmax(&volume_control_data->ext, SND_PCM_EXTPLUG_HW_CHANNELS, channels, channels);
+  snd_pcm_extplug_set_slave_param(&volume_control_data->ext, SND_PCM_EXTPLUG_HW_CHANNELS, channels);
   snd_pcm_extplug_set_param(&volume_control_data->ext, SND_PCM_EXTPLUG_HW_FORMAT, SND_PCM_FORMAT_S16);
   snd_pcm_extplug_set_slave_param(&volume_control_data->ext, SND_PCM_EXTPLUG_HW_FORMAT, SND_PCM_FORMAT_S16);
-  
   
   *pcmp = volume_control_data->ext.pcm;
 
